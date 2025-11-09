@@ -1,0 +1,192 @@
+# Quantum Bioenergetics Mapping - Docker Compose
+# Development and production deployment configuration
+
+version: '3.8'
+
+services:
+  # Main Streamlit Application
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8501:8501"
+    environment:
+      - STREAMLIT_SERVER_PORT=8501
+      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
+      - API_BASE_URL=http://api:8000
+    volumes:
+      - ./data:/app/data:ro
+      - ./results:/app/results
+      - ./temp:/app/temp
+    depends_on:
+      - api
+      - redis
+    restart: unless-stopped
+    networks:
+      - qbm-network
+
+  # FastAPI Backend
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=sqlite:///./qbm.db
+    volumes:
+      - ./api:/app/api
+      - ./physics_core:/app/physics_core
+      - ./results:/app/results
+      - ./temp:/app/temp
+    depends_on:
+      - redis
+    restart: unless-stopped
+    networks:
+      - qbm-network
+
+  # Redis for Caching and Background Jobs
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+    networks:
+      - qbm-network
+
+  # Nginx Reverse Proxy (Production)
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - app
+      - api
+    restart: unless-stopped
+    networks:
+      - qbm-network
+    profiles:
+      - production
+
+  # Monitoring with Prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+    restart: unless-stopped
+    networks:
+      - qbm-network
+    profiles:
+      - monitoring
+
+  # Grafana for Visualization
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks:
+      - qbm-network
+    profiles:
+      - monitoring
+
+  # PostgreSQL Database (Optional - for production)
+  postgres:
+    image: postgres:15-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=qbm_platform
+      - POSTGRES_USER=qbm_user
+      - POSTGRES_PASSWORD=qbm_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    restart: unless-stopped
+    networks:
+      - qbm-network
+    profiles:
+      - production
+
+  # Celery Worker for Background Tasks
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: celery -A api.main worker --loglevel=info
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=sqlite:///./qbm.db
+    volumes:
+      - ./api:/app/api
+      - ./physics_core:/app/physics_core
+      - ./results:/app/results
+      - ./temp:/app/temp
+    depends_on:
+      - redis
+    restart: unless-stopped
+    networks:
+      - qbm-network
+    profiles:
+      - production
+
+  # Celery Beat for Scheduled Tasks
+  celery-beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: celery -A api.main beat --loglevel=info
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./api:/app/api
+      - ./physics_core:/app/physics_core
+    depends_on:
+      - redis
+    restart: unless-stopped
+    networks:
+      - qbm-network
+    profiles:
+      - production
+
+# Named Volumes
+volumes:
+  redis_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  postgres_data:
+    driver: local
+
+# Networks
+networks:
+  qbm-network:
+    driver: bridge
